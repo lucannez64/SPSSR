@@ -1,6 +1,6 @@
 ---
 
-# Secure Password Storage Protocol
+# Quantum-resistant User Secret Encryption with Nonce Derivation
 
 This protocol provides a way to securely store passwords on a server such that they can be retrieved by authorized clients, but are not accessible to the server or to unauthorized parties. The protocol uses a combination of public-key cryptography, symmetric-key cryptography, and key derivation functions to provide multiple layers of security.
 
