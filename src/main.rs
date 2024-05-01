@@ -12,6 +12,251 @@ use std::{sync::{Arc, Mutex}};
 use sled::{Db};
 use serde::{Serialize, Deserialize};
 use crystals_dilithium::dilithium5::{Keypair, PublicKey, SecretKey};
+use uuid::Uuid;
+use std::collections::HashMap;
+
+use tonic::{Request, Response, Status};
+
+pub mod qusend {
+    tonic::include_proto!("qusend");
+}
+
+use qusend::{
+    password_manager_server::{PasswordManager, PasswordManagerServer},
+    AddPasswordRequest, AddPasswordResponse, AuthenticateRequest, AuthenticateResponse,
+    CreateUserRequest, CreateUserResponse, DeletePasswordRequest, DeletePasswordResponse,
+    InitCommunicationRequest, InitCommunicationResponse, ListPasswordsRequest,
+    ListPasswordsResponse, PasswordMetadata, RetrievePasswordRequest, RetrievePasswordResponse,
+    UpdatePasswordRequest, UpdatePasswordResponse,
+};
+
+#[derive(Debug, Default)]
+struct PasswordManagerService {
+    users: Arc<Mutex<HashMap<i64, UserData>>>,
+    challenges: Arc<Mutex<HashMap<i64,Vec<u8>>>>
+}
+
+#[derive(Debug, Default)]
+struct UserData {
+    public_dilithium_key: Vec<u8>,
+    public_kyber_key: Vec<u8>,
+    salt: Vec<u8>,
+    passwords: HashMap<i64, PasswordEntry>,
+    auth_token: i64,
+}
+
+#[derive(Debug, Default)]
+struct PasswordEntry {
+    ciphertext: Vec<u8>,
+    metadata: PasswordMetadata,
+}
+
+#[tonic::async_trait]
+impl PasswordManager for PasswordManagerService {
+    async fn create_user(
+        &self,
+        request: Request<CreateUserRequest>,
+    ) -> Result<Response<CreateUserResponse>, Status> {
+        let req = request.into_inner();
+        let id = Uuid::new_v4();
+        let user_id = id.as_64();
+        let user_data = UserData {
+            public_dilithium_key: req.public_dilithium_key,
+            public_kyber_key: req.public_kyber_key,
+            salt: req.salt,
+            ..Default::default()
+        };
+        self.users.lock().unwrap().insert(user_id, user_data);
+
+        let response = CreateUserResponse {
+            id: user_id,
+            code: 0,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn init_communication(
+        &self,
+        request: Request<InitCommunicationRequest>,
+    ) -> Result<Response<InitCommunicationResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let mut rng = OsRng;
+        let user_data = self.users.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?; 
+        let user_public_key = user_data.public_kyber_key;
+        let (ciphertext, shared_secret) = encapsulate(&user_public_key, &mut rng).unwrap();
+
+        let response = InitCommunicationResponse { ciphertext: ciphertext.to_vec() };
+        Ok(Response::new(response))
+    }
+
+    async fn authenticate_start(
+        &self,
+        request: Request<AuthenticateStartRequest>,
+    ) -> Result<Response<AuthenticateStartResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let user_data = self.users.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+        let mut rng = OsRng; 
+        let mut buf = [0u8; 256];
+        rng.fill_bytes(&mut buf);
+        let challenge_hash = blake3::hash(&buf);
+        let challenge = challenge_hash.as_bytes();
+        self.challenges.lock().unwrap().insert(user_id, challenge.to_vec() );
+        let response = AuthenticateStartResponse { challenge };
+
+        Ok(Response::new(response))
+    }
+
+    async fn authenticate(
+        &self,
+        request: Request<AuthenticateRequest>,
+    ) -> Result<Response<AuthenticateResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let signature = req.signature;
+        let user_data = self.users.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+        let user_public_key = PublicKey::from_bytes(user_data.public_dilithium_key);
+        let challenge = self.challenges.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        let signature_valid = user_public_key.verify(challenge.as_slice(), &signature);
+        if !signature_valid {
+            return Err(Status::unauthenticated("Invalid signature"));
+        }
+
+        let auth_token = todo!()/* generate auth token */;
+        user_data.auth_token = auth_token;
+
+        let response = AuthenticateResponse {
+            code: 0,
+            auth_token,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn add_password(
+        &self,
+        request: Request<AddPasswordRequest>,
+    ) -> Result<Response<AddPasswordResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let user_data = self.users.lock().unwrap().get_mut(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        let auth_token_valid = todo!();
+        if !auth_token_valid {
+            return Err(Status::unauthenticated("Invalid auth token"));
+        }
+
+        let password_id = todo!() /* generate password ID */;
+        let metadata = todo!() /* parse metadata */;
+        let password_entry = PasswordEntry {
+            ciphertext: req.ciphertext,
+            metadata,
+        };
+        user_data.passwords.insert(password_id, password_entry);
+
+        let response = AddPasswordResponse {
+            metadata,
+            code: 0,
+            password_id,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn retrieve_password(
+        &self,
+        request: Request<RetrievePasswordRequest>,
+    ) -> Result<Response<RetrievePasswordResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let password_id = req.password_id;
+        let user_data = self.users.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        let password_entry = user_data.passwords.get(&password_id).ok_or_else(|| {
+            Status::not_found("Password not found")
+        })?;
+
+        let response = RetrievePasswordResponse {
+            ciphertext: password_entry.ciphertext.clone(),
+            code: 0,
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn delete_password(
+        &self,
+        request: Request<DeletePasswordRequest>,
+    ) -> Result<Response<DeletePasswordResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let password_id = req.password_id;
+        let user_data = self.users.lock().unwrap().get_mut(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        user_data.passwords.remove(&password_id);
+
+        let response = DeletePasswordResponse { code: 0 };
+        Ok(Response::new(response))
+    }
+
+    async fn update_password(
+        &self,
+        request: Request<UpdatePasswordRequest>,
+    ) -> Result<Response<UpdatePasswordResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let password_id = req.password_id;
+        let user_data = self.users.lock().unwrap().get_mut(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        let password_entry = user_data.passwords.get_mut(&password_id).ok_or_else(|| {
+            Status::not_found("Password not found")
+        })?;
+
+        password_entry.ciphertext = req.ciphertext;
+
+        let response = UpdatePasswordResponse { code: 0 };
+        Ok(Response::new(response))
+    }
+
+    async fn list_passwords(
+        &self,
+        request: Request<ListPasswordsRequest>,
+    ) -> Result<Response<ListPasswordsResponse>, Status> {
+        let req = request.into_inner();
+        let user_id = req.user_id;
+        let user_data = self.users.lock().unwrap().get(&user_id).ok_or_else(|| {
+            Status::not_found("User not found")
+        })?;
+
+        let metadata: Vec<_> = user_data
+            .passwords
+            .values()
+            .map(|entry| entry.metadata.clone())
+            .collect();
+
+        let response = ListPasswordsResponse {
+            metadata,
+            code: 0,
+        };
+        Ok(Response::new(response))
+    }
+}
+
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -39,11 +284,11 @@ struct Metadata {
     otp_string: Option<Vec<u8>>,
 }
 
-struct PasswordManager {
+struct PasswordManagerDB {
     db: Arc<Mutex<Db>>,
 }
 
-impl PasswordManager {
+impl PasswordManagerDB {
     fn new() -> Self {
         let db = Arc::new(Mutex::new(sled::open("password_manager.db").unwrap()));
         Self { db }
@@ -115,7 +360,9 @@ impl PasswordManager {
         tree.remove(serde_json::to_vec(&id.to_be_bytes()).unwrap()).unwrap();
     }
 }
-fn main() {
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>>{
     use std::io::{stdin};
     println!("Please choose an option: ");
     let mut s=String::new();
@@ -207,7 +454,7 @@ fn main() {
         let decrypted_result: bool = result.decrypt(&client_key);
         println!("{}", decrypted_result);
     } else if &s == "db" { 
-        let mut password_manager = PasswordManager::new();
+        let mut password_manager = PasswordManagerDB::new();
 
         // Create a new user.
         let user_id = password_manager.create_user(User {
@@ -376,7 +623,19 @@ fn main() {
         let nonce = <std::option::Option<Vec<u8>> as Clone>::clone(&user_data[0].nonce).unwrap();
         let pp = decrypt_password(&derive_user_key(&public_key, &server_secret,&<std::option::Option<Vec<u8>> as Clone>::clone(&user_data[0].salt).unwrap()),&user_data[0].password,&nonce);
         println!("{}", str::from_utf8(pp.as_slice()).unwrap());
+    } else if &s == "serv" {
+        let addr = "[::1]:50051".parse().unwrap();
+        let password_manager_service = PasswordManagerService::default();
+
+        println!("PasswordManager server listening on {}", addr);
+
+        tonic::transport::server::Server::builder()
+            .add_service(PasswordManagerServer::new(password_manager_service))
+            .serve(addr)
+            .await?;
     } else {
-        println!("\n Unknown option \nCurrent possible options : shards; password; homoc; db; auth; rotation");
+        println!("\n Unknown option \nCurrent possible options : shards; password; homoc; db; auth; rotation; serv");
     }
+
+    Ok(())
 }
